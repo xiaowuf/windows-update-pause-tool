@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
@@ -12,8 +11,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyCompany("开源社区")]
 [assembly: System.Reflection.AssemblyProduct("Windows 更新暂停工具")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright © 2026")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
 
 namespace WindowsUpdatePauseTool
 {
@@ -255,14 +254,14 @@ namespace WindowsUpdatePauseTool
         private void RestoreButtonClick(object sender, EventArgs e)
         {
             var result = MessageBox.Show(
-                "这会移除本工具设置的暂停日期和自动更新禁用策略。确定恢复吗？",
+                "这会解除自动更新禁用策略，并将暂停截止时间调整到约 1 小时后。\r\n\r\n确定恢复吗？",
                 "确认恢复更新",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question,
                 MessageBoxDefaultButton.Button1);
             if (result != DialogResult.Yes) return;
 
-            RunOperation(UpdateSettings.Restore, "更新设置已恢复。建议打开 Windows 更新并检查一次更新。", false);
+            RunOperation(UpdateSettings.Restore, "恢复设置已应用。Windows 将在约 1 小时后恢复自动检查更新；届时也可以手动点击“检查更新”。", false);
         }
 
         private void RunOperation(Action operation, string successMessage, bool applying)
@@ -363,7 +362,6 @@ namespace WindowsUpdatePauseTool
     {
         private const string SettingsPath = @"SOFTWARE\Microsoft\WindowsUpdate\UX\Settings";
         private const string PolicyPath = @"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU";
-        private const string BackupPath = @"SOFTWARE\WindowsUpdatePauseTool\Backup";
 
         private static readonly string[] StartNames =
         {
@@ -385,7 +383,6 @@ namespace WindowsUpdatePauseTool
 
             using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
             {
-                BackupOnce(baseKey);
                 using (RegistryKey settings = baseKey.CreateSubKey(SettingsPath, true))
                 {
                     if (settings == null) throw new InvalidOperationException("无法打开 Windows 更新设置。");
@@ -400,31 +397,41 @@ namespace WindowsUpdatePauseTool
                 {
                     if (policy == null) throw new InvalidOperationException("无法打开 Windows 更新策略。");
                     if (locked) policy.SetValue("NoAutoUpdate", 1, RegistryValueKind.DWord);
-                    else RestorePolicyValueFromBackup(baseKey, policy);
+                    else policy.DeleteValue("NoAutoUpdate", false);
                 }
             }
         }
 
         internal static void Restore()
         {
+            DateTime startUtc = DateTime.UtcNow;
+            DateTime resumeUtc = CalculateResumeUtc(startUtc);
+            string startText = startUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+            string resumeText = resumeUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+
             using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
             {
-                using (RegistryKey settings = baseKey.OpenSubKey(SettingsPath, true))
+                using (RegistryKey settings = baseKey.CreateSubKey(SettingsPath, true))
                 {
-                    if (settings != null)
-                    {
-                        foreach (string name in StartNames) RestoreStringValueFromBackup(baseKey, settings, name);
-                        foreach (string name in EndNames) RestoreStringValueFromBackup(baseKey, settings, name);
-                    }
+                    if (settings == null) throw new InvalidOperationException("无法打开 Windows 更新设置。");
+                    foreach (string name in StartNames) settings.SetValue(name, startText, RegistryValueKind.String);
+                    foreach (string name in EndNames) settings.SetValue(name, resumeText, RegistryValueKind.String);
                 }
 
-                using (RegistryKey policy = baseKey.OpenSubKey(PolicyPath, true))
+                using (RegistryKey policy = baseKey.CreateSubKey(PolicyPath, true))
                 {
-                    if (policy != null) RestorePolicyValueFromBackup(baseKey, policy);
+                    if (policy == null) throw new InvalidOperationException("无法打开 Windows 更新策略。");
+                    policy.DeleteValue("NoAutoUpdate", false);
                 }
 
-                RestoreBackup(baseKey);
+                baseKey.DeleteSubKeyTree(@"SOFTWARE\WindowsUpdatePauseTool", false);
             }
+        }
+
+        internal static DateTime CalculateResumeUtc(DateTime utcNow)
+        {
+            DateTime normalized = utcNow.Kind == DateTimeKind.Utc ? utcNow : utcNow.ToUniversalTime();
+            return normalized.AddHours(1);
         }
 
         internal static UpdateState ReadState()
@@ -456,72 +463,5 @@ namespace WindowsUpdatePauseTool
             return state;
         }
 
-        private static void BackupOnce(RegistryKey baseKey)
-        {
-            using (RegistryKey backup = baseKey.CreateSubKey(BackupPath, true))
-            {
-                if (backup == null || Convert.ToInt32(backup.GetValue("Created", 0)) == 1) return;
-                using (RegistryKey policy = baseKey.OpenSubKey(PolicyPath, false))
-                {
-                    object oldValue = policy == null ? null : policy.GetValue("NoAutoUpdate", null);
-                    backup.SetValue("NoAutoUpdateExisted", oldValue == null ? 0 : 1, RegistryValueKind.DWord);
-                    if (oldValue != null) backup.SetValue("NoAutoUpdateValue", Convert.ToInt32(oldValue), RegistryValueKind.DWord);
-                }
-                using (RegistryKey settings = baseKey.OpenSubKey(SettingsPath, false))
-                {
-                    var names = new List<string>();
-                    names.AddRange(StartNames);
-                    names.AddRange(EndNames);
-                    foreach (string name in names)
-                    {
-                        object oldValue = settings == null ? null : settings.GetValue(name, null);
-                        backup.SetValue(name + "Existed", oldValue == null ? 0 : 1, RegistryValueKind.DWord);
-                        if (oldValue != null) backup.SetValue(name + "Value", Convert.ToString(oldValue, CultureInfo.InvariantCulture), RegistryValueKind.String);
-                    }
-                }
-                backup.SetValue("Created", 1, RegistryValueKind.DWord);
-            }
-        }
-
-        private static void RestorePolicyValueFromBackup(RegistryKey baseKey, RegistryKey policy)
-        {
-            using (RegistryKey backup = baseKey.OpenSubKey(BackupPath, false))
-            {
-                bool existed = backup != null && Convert.ToInt32(backup.GetValue("NoAutoUpdateExisted", 0)) == 1;
-                if (existed)
-                    policy.SetValue("NoAutoUpdate", Convert.ToInt32(backup.GetValue("NoAutoUpdateValue", 0)), RegistryValueKind.DWord);
-                else
-                    policy.DeleteValue("NoAutoUpdate", false);
-            }
-        }
-
-        private static void RestoreStringValueFromBackup(RegistryKey baseKey, RegistryKey settings, string name)
-        {
-            using (RegistryKey backup = baseKey.OpenSubKey(BackupPath, false))
-            {
-                bool existed = backup != null && Convert.ToInt32(backup.GetValue(name + "Existed", 0)) == 1;
-                if (existed)
-                    settings.SetValue(name, Convert.ToString(backup.GetValue(name + "Value", ""), CultureInfo.InvariantCulture), RegistryValueKind.String);
-                else
-                    settings.DeleteValue(name, false);
-            }
-        }
-
-        private static void RestoreBackup(RegistryKey baseKey)
-        {
-            using (RegistryKey backup = baseKey.OpenSubKey(BackupPath, false))
-            {
-                if (backup == null || Convert.ToInt32(backup.GetValue("Created", 0)) != 1) return;
-                bool existed = Convert.ToInt32(backup.GetValue("NoAutoUpdateExisted", 0)) == 1;
-                if (existed)
-                {
-                    using (RegistryKey policy = baseKey.CreateSubKey(PolicyPath, true))
-                    {
-                        policy.SetValue("NoAutoUpdate", Convert.ToInt32(backup.GetValue("NoAutoUpdateValue", 0)), RegistryValueKind.DWord);
-                    }
-                }
-            }
-            baseKey.DeleteSubKeyTree(@"SOFTWARE\WindowsUpdatePauseTool", false);
-        }
     }
 }
